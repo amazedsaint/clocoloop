@@ -3,10 +3,10 @@
 **Automated Claude + Codex code review loop.** Claude writes code, Codex reviews it, Claude fixes what Codex finds — looping until the code passes review, then submitting a pull request.
 
 ```
-  ┌──────────┐    ┌──────────┐    ┌──────────┐
+  ┌──────────┐     ┌──────────┐    ┌──────────┐
   │  Claude   │───>│  Codex   │───>│  Claude  │
   │ implement │    │  review  │    │   fix    │
-  └──────────┘    └──────────┘    └──────────┘
+  └──────────┘     └──────────┘    └──────────┘
        │               │               │
        │               v               │
        │         Pass? ──> PR          │
