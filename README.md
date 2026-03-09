@@ -1,146 +1,77 @@
 # CloCoLoop
 
-**Automated Claude + Codex code review loop.** Claude writes code, Codex reviews it, Claude fixes what Codex finds — looping until the code passes review, then submitting a pull request. Runs in tmux, survives SSH disconnects.
+**Automated Claude + Codex code review loop.** Claude writes code, Codex reviews it, Claude fixes what Codex finds — looping until the code passes review, then submitting a pull request.
 
 ```
-┌──────────────────────────────────────────────────┐
-│  tmux session (background)                       │
-│                                                  │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐   │
-│  │  Claude   │───>│  Codex   │───>│  Claude  │   │
-│  │ implement │    │  review  │    │   fix    │   │
-│  └──────────┘    └──────────┘    └──────────┘   │
-│       │               │               │          │
-│       │               v               │          │
-│       │         Pass? ──> PR          │          │
-│       │         Fail? ──> Loop <──────┘          │
-│                                                  │
-│  Status: reviews/<branch>/status.json            │
-│  Logs:   reviews/<branch>/loop.log               │
-└──────────────────────────────────────────────────┘
-```
-
-## Why
-
-AI coding assistants make mistakes. Manual review is slow. CloCoLoop pits two independent AI systems against each other: Claude implements, Codex reviews from a different perspective. They iterate until the code is clean. You get a PR with a full audit trail.
-
-## Prerequisites
-
-```bash
-# Claude Code (Anthropic's CLI)
-npm install -g @anthropic-ai/claude-code
-
-# Codex CLI (OpenAI)
-npm install -g @openai/codex
-
-# GitHub CLI (for PR creation)
-# macOS: brew install gh
-# Ubuntu: sudo apt install gh
-gh auth login
-
-# tmux (for background persistence)
-# macOS: brew install tmux
-# Ubuntu: sudo apt install tmux
-```
-
-Verify:
-
-```bash
-claude --version && codex --version && gh --version && tmux -V
+  ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │  Claude   │───>│  Codex   │───>│  Claude  │
+  │ implement │    │  review  │    │   fix    │
+  └──────────┘    └──────────┘    └──────────┘
+       │               │               │
+       │               v               │
+       │         Pass? ──> PR          │
+       │         Fail? ──> Loop <──────┘
 ```
 
 ## Install
 
+### As Claude Code skills (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/amazedsaint/clocoloop/main/install.sh | bash
+```
+
+This installs `/feature-loop` and `/review-loop` as slash commands in Claude Code.
+
+### As standalone scripts
+
 ```bash
 git clone https://github.com/amazedsaint/clocoloop.git
 cd clocoloop
-chmod +x review_loop.sh feature_loop.sh
+chmod +x feature_loop.sh review_loop.sh
 ```
 
-Or just copy the two scripts into your project's `scripts/` directory.
+### Prerequisites
 
-## Quick Start
-
-### Review uncommitted changes
-
-```bash
-./review_loop.sh
-```
-
-Launches in tmux. Codex reviews your current diff, Claude fixes issues, repeat until clean.
-
-### Develop a feature end-to-end
-
-```bash
-./feature_loop.sh "fix-auth-bug" "Fix the session expiry bug in auth.py"
-```
-
-Creates a branch, Claude implements the task, Codex reviews, Claude fixes P1/P2 issues, pushes and opens a PR when Codex approves.
-
-### Monitor progress
-
-```bash
-# Watch live
-tmux attach -t feature-fix-auth-bug
-
-# Poll status
-cat reviews/fix-auth-bug/status.json
-
-# Follow logs
-tail -f reviews/fix-auth-bug/loop.log
-
-# List all running loops
-tmux list-sessions | grep -E 'feature-|review-'
-```
+- [Claude Code](https://www.npmjs.com/package/@anthropic-ai/claude-code) — `npm install -g @anthropic-ai/claude-code`
+- [Codex CLI](https://www.npmjs.com/package/@openai/codex) — `npm install -g @openai/codex`
+- [GitHub CLI](https://cli.github.com/) — `brew install gh` / `apt install gh`, then `gh auth login`
+- [tmux](https://github.com/tmux/tmux) — `brew install tmux` / `apt install tmux`
 
 ## Usage
 
-### `review_loop.sh`
+### Claude Code skills
 
-Reviews whatever is currently uncommitted in your repo.
-
-```bash
-# Run from your project root
-/path/to/clocoloop/review_loop.sh
-
-# Or if you copied it to scripts/
-bash scripts/review_loop.sh
+```
+/feature-loop fix-auth Fix the session expiry bug in auth.py
+/feature-loop add-tests Add unit tests for the payment module
+/review-loop
 ```
 
-The loop:
-1. Runs `codex exec review --uncommitted` on your current diff
-2. If issues found, Claude reads the review and fixes them
-3. Repeats until Codex says "looks good" or max iterations hit
-
-### `feature_loop.sh`
-
-Full feature delivery — branch, implement, review, fix, PR.
+### Standalone scripts
 
 ```bash
-./feature_loop.sh <branch-name> <task-description>
-```
+# Feature loop: branch, implement, review, fix, PR
+./feature_loop.sh "fix-auth" "Fix the session expiry bug in auth.py"
 
-Examples:
-
-```bash
-# Fix a bug
-./feature_loop.sh "fix-auth" "Fix session expiry bug in auth.py"
-
-# Add tests
-./feature_loop.sh "add-tests" "Add unit tests for the payment module"
-
-# Refactor
-./feature_loop.sh "refactor-db" "Extract database queries into repository pattern"
+# Review loop: review uncommitted changes, fix, repeat
+./review_loop.sh
 ```
 
 ### Environment variables
 
 ```bash
-# Use a different base branch (default: main)
 BASE_BRANCH=develop ./feature_loop.sh "my-feature" "Add payment processing"
+MAX_ITERATIONS=10 ./feature_loop.sh "big-refactor" "Refactor the auth system"
+```
 
-# Allow more review iterations (default: 5)
-MAX_ITERATIONS=10 ./feature_loop.sh "big-refactor" "Refactor the entire auth system"
+### Monitor progress
+
+```bash
+tmux attach -t feature-fix-auth          # Watch live
+cat reviews/fix-auth/status.json         # Poll status
+tail -f reviews/fix-auth/loop.log        # Stream logs
+tmux list-sessions | grep -E 'feature-|review-'  # List all loops
 ```
 
 ### Run multiple loops in parallel
@@ -151,134 +82,60 @@ Each loop runs in its own tmux session on a separate branch:
 ./feature_loop.sh "fix-auth" "Fix session expiry bug"
 ./feature_loop.sh "add-tests" "Add unit tests for payments"
 ./feature_loop.sh "refactor-db" "Extract DB queries into repository pattern"
-
-# Monitor all
-for branch in fix-auth add-tests refactor-db; do
-    state=$(python3 -c "import json; print(json.load(open('reviews/$branch/status.json'))['state'])" 2>/dev/null || echo "unknown")
-    echo "$branch: $state"
-done
 ```
 
-## Status File
+## Status file
 
 The feature loop writes `reviews/<branch>/status.json`:
 
 ```json
 {
-    "branch": "fix-auth-bug",
-    "base": "main",
+    "branch": "fix-auth",
     "state": "reviewing",
     "iteration": 2,
     "max_iterations": 5,
     "message": "Codex reviewing (iteration 2)",
-    "pr_url": "",
-    "task": "Fix the session expiry bug in auth.py",
-    "timestamp": "2026-03-08T20:35:00+00:00",
-    "log": "reviews/fix-auth-bug/loop.log"
+    "task": "Fix the session expiry bug in auth.py"
 }
 ```
 
 States: `starting` > `implementing` > `reviewing` > `fixing` > `creating_pr` > `completed`
 
-Error states: `push_failed`, `pr_failed`, `max_iterations`
+Error states: `tool_error`, `push_failed`, `pr_failed`, `max_iterations`
 
-## Gotchas
+## How it works
 
-Hard-won lessons from running this in production.
+**Feature loop** (`feature_loop.sh`):
+1. Creates a feature branch from base
+2. Claude implements the task via `claude -p`
+3. Codex reviews the diff with `codex exec review --base <branch>`
+4. If P1/P2 issues found, Claude fixes them and the loop repeats
+5. On approval, pushes and creates a PR via `gh`
 
-### Codex outputs to stderr
+**Review loop** (`review_loop.sh`):
+1. Codex reviews uncommitted changes with `codex exec review --uncommitted`
+2. If issues found, Claude fixes them (no commit)
+3. Repeats until clean or max iterations reached
 
-`codex exec review` sends output to stderr, not stdout:
+**Safety features:**
+- PID-based lockfiles prevent concurrent runs on the same branch
+- Review content is sanitized before passing to Claude (prompt injection defense)
+- Git state is verified after each agent step (commit detection, uncommitted change warnings)
+- `write_status()` uses `json.dump()` for proper JSON escaping
+- Explicit error handling with exit code capture instead of blanket `|| true`
+- `printf '%q'` quoting for all tmux command interpolation
 
-```bash
-# Wrong — captures nothing
-codex exec review --uncommitted > review.md
+## Tips
 
-# Correct
-codex exec review --uncommitted 2> review.md
-```
-
-### Use `--fork-session` not `--resume`
-
-Claude's `--resume` fails on active sessions. Use `--continue --fork-session`:
-
-```bash
-# Wrong — fails if session is active
-claude -p --resume SESSION_ID "Fix the bugs"
-
-# Correct
-claude -p --continue --fork-session "Fix the bugs"
-```
-
-### `codex review` vs `codex exec review`
-
-Different commands:
-- `codex review` — limited, doesn't support `--uncommitted` with a prompt
-- `codex exec review` — full-featured, supports `--base BRANCH` and `--uncommitted`
-
-### Approval detection is fuzzy
-
-Codex doesn't output structured pass/fail. The scripts grep for patterns:
-
-```bash
-grep -qi 'LGTM\|no issues\|looks good\|no problems' review.md
-grep -q '"findings": \[\]' review.md
-```
-
-And check severity — only loop on P1/P2, treat P3-only as approved.
-
-### Permission prompts hang in background
-
-Always use `--dangerously-skip-permissions` for unattended Claude. Restrict `--allowedTools` to limit scope:
-
-```bash
-claude -p \
-    --dangerously-skip-permissions \
-    --allowedTools "Read,Edit,Write,Bash,Glob,Grep" \
-    "Your prompt"
-```
-
-### Large diffs are slow
-
-Codex review on a 2000+ line diff can take 5-10 minutes. Don't set aggressive timeouts.
-
-### Gitignore review artifacts
-
-Add to your `.gitignore`:
-
-```gitignore
-reviews/
-review.md
-```
-
-## CI Integration
-
-Trigger from CI or webhooks:
-
-```bash
-# In a GitHub Action
-ssh your-server "cd /path/to/repo && \
-    /path/to/feature_loop.sh 'auto-fix-$ISSUE_NUMBER' '$ISSUE_TITLE'"
-```
-
-Poll for completion:
-
-```bash
-while true; do
-    state=$(python3 -c "
-import json
-print(json.load(open('reviews/my-feature/status.json'))['state'])
-")
-    [ "$state" = "completed" ] || [ "$state" = "max_iterations" ] && break
-    sleep 60
-done
-```
+- `codex exec review` outputs to **stderr**, not stdout — the scripts handle this with `2>`
+- Always use `--dangerously-skip-permissions` and `--allowedTools` for unattended Claude
+- Large diffs (2000+ lines) can take 5-10 minutes for Codex to review
+- Add `reviews/` to your `.gitignore`
+- If Codex hasn't approved after 5 rounds, the issue likely needs human judgment
 
 ## Cost
 
-Each iteration: one Codex review call + one Claude fix call. A typical 3-iteration loop costs ~$1-3 in API calls. Full feature loop (implementation + review cycles) runs $2-5 total.
-
-Set `MAX_ITERATIONS` conservatively. If Codex hasn't approved after 5 rounds, the issue likely needs human judgment.
+Each iteration: one Codex review call + one Claude fix call. A typical 3-iteration loop costs ~$1-3. Full feature loop (implementation + review cycles) runs $2-5 total.
 
 ## License
 

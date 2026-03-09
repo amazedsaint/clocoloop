@@ -21,22 +21,20 @@ Run from the current working directory (must be a git repo):
 bash "${CLAUDE_SKILL_DIR}/scripts/review_loop.sh"
 ```
 
-The script launches a persistent tmux session (`review-loop`) and returns immediately.
-
-After running, report to the user:
-- Tmux session name
-- `tmux attach -t review-loop` to watch live
-- How to find logs in `reviews/`
-
-## Environment variables
-
-If the user specifies a max iteration count (e.g. `/review-loop 10`), set it:
+If the user specifies a number (e.g. `/review-loop 10`), set MAX_ITERATIONS:
 
 ```bash
 MAX_ITERATIONS=<n> bash "${CLAUDE_SKILL_DIR}/scripts/review_loop.sh"
 ```
 
 $ARGUMENTS
+
+The script launches a persistent tmux session (`review-loop`) and returns immediately.
+
+After running, report to the user:
+- Tmux session name
+- `tmux attach -t review-loop` to watch live
+- How to find logs in `reviews/`
 
 ## Prerequisites
 
