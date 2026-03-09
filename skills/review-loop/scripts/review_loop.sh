@@ -39,7 +39,9 @@ check_deps() {
             missing=1
         fi
     done
-    [ "$missing" = "1" ] && exit 1
+    if [ "$missing" = "1" ]; then
+        exit 1
+    fi
 }
 
 acquire_lock() {
