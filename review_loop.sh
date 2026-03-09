@@ -25,6 +25,7 @@ mkdir -p "$REVIEWS_DIR"
 
 MAX_ITERATIONS="${MAX_ITERATIONS:-5}"
 LOG="$REVIEWS_DIR/loop_$(date +%Y%m%d_%H%M%S).log"
+LOCKFILE="$REVIEWS_DIR/.clocoloop-review.lock"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"
@@ -41,7 +42,68 @@ check_deps() {
     [ "$missing" = "1" ] && exit 1
 }
 
+acquire_lock() {
+    if [ -f "$LOCKFILE" ]; then
+        local old_pid
+        old_pid=$(cat "$LOCKFILE" 2>/dev/null || echo "")
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "Error: another review loop is running (PID $old_pid). Lockfile: $LOCKFILE"
+            exit 1
+        fi
+        log "WARNING: Removing stale lockfile (PID $old_pid no longer running)"
+        rm -f "$LOCKFILE"
+    fi
+    echo $$ > "$LOCKFILE"
+}
+
+release_lock() {
+    rm -f "$LOCKFILE"
+}
+
+trap release_lock EXIT INT TERM
+
+check_approval() {
+    local review_file="$1"
+
+    # Highest confidence: explicit markers
+    if grep -qiE '\bAPPROVED\b' "$review_file"; then
+        return 0
+    fi
+    if grep -qiE '\bREJECTED\b' "$review_file"; then
+        return 1
+    fi
+
+    # Structured output: empty findings
+    if grep -q '"findings": \[\]' "$review_file" 2>/dev/null; then
+        return 0
+    fi
+
+    # Full-phrase approval patterns (avoid overly broad terms)
+    if grep -qiE 'looks good to me|no issues found|no problems found|no bugs found|no changes needed|\bLGTM\b' "$review_file"; then
+        return 0
+    fi
+
+    # Check severity — approve if no P1/P2 issues
+    local p1_count p2_count
+    p1_count=$(grep -ciE '\[P1\]|\bcritical\b|\bregression\b|\bbroken\b|\bcrash\b' "$review_file" 2>/dev/null || true)
+    p1_count="${p1_count:-0}"
+    p2_count=$(grep -ciE '\[P2\]|\bmedium\b severity|\bbug\b|\bincorrect\b' "$review_file" 2>/dev/null || true)
+    p2_count="${p2_count:-0}"
+    if [ "$p1_count" = "0" ] && [ "$p2_count" = "0" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+sanitize_review() {
+    local review_file="$1"
+    grep -vE '^\s*(system|assistant|user)\s*:|^\s*<\s*(system|prompt|instruction)|ignore\s+(previous|above)\s+instructions|you\s+are\s+now|forget\s+(your|all)\s+(instructions|rules)' "$review_file" || cat "$review_file"
+}
+
 run_loop() {
+    acquire_lock
+
     log "Starting review loop (max $MAX_ITERATIONS iterations)"
     log "Repo: $REPO_DIR"
 
@@ -53,10 +115,15 @@ run_loop() {
         REVIEW_FILE="$REVIEWS_DIR/codex_review_iter${i}_$(date +%Y%m%d_%H%M%S).md"
         log "Step 1: Running codex review -> $REVIEW_FILE"
 
-        codex exec review --uncommitted 2> "$REVIEW_FILE" || true
+        local exit_code=0
+        codex exec review --uncommitted 2> "$REVIEW_FILE" || exit_code=$?
 
         if [ ! -f "$REVIEW_FILE" ] || [ ! -s "$REVIEW_FILE" ]; then
-            log "Review file empty or not created. Skipping iteration."
+            if [ "$exit_code" -ne 0 ]; then
+                log "ERROR: Codex review failed (exit code $exit_code) with no output."
+            else
+                log "Review file empty or not created. Skipping iteration."
+            fi
             sleep 5
             continue
         fi
@@ -64,35 +131,38 @@ run_loop() {
         REVIEW_LINES=$(wc -l < "$REVIEW_FILE")
         log "Review written to $REVIEW_FILE ($REVIEW_LINES lines)"
 
-        # Step 2: Check if Codex found no issues
-        if grep -qi "LGTM\|no issues\|looks good\|no problems\|no bugs\|no changes needed" "$REVIEW_FILE"; then
+        # Step 2: Check if Codex approves
+        if check_approval "$REVIEW_FILE"; then
             log "Codex approves! Review loop complete."
             break
         fi
 
-        if grep -q '"findings": \[\]' "$REVIEW_FILE" 2>/dev/null; then
-            log "Codex returned empty findings. Review loop complete."
-            break
-        fi
-
-        # Check severity — only continue loop for P1/P2
-        P1_COUNT=$(grep -ci '\[P1\]\|critical\|regression\|broken\|crash' "$REVIEW_FILE" 2>/dev/null || echo "0")
-        P2_COUNT=$(grep -ci '\[P2\]\|medium\|bug\|incorrect' "$REVIEW_FILE" 2>/dev/null || echo "0")
-        if [ "$P1_COUNT" = "0" ] && [ "$P2_COUNT" = "0" ]; then
-            log "No P1/P2 issues found — treating as approved."
-            break
-        fi
+        # Count P1/P2 for logging
+        local p1_count p2_count
+        p1_count=$(grep -ciE '\[P1\]|\bcritical\b|\bregression\b|\bbroken\b|\bcrash\b' "$REVIEW_FILE" 2>/dev/null || true)
+        p1_count="${p1_count:-0}"
+        p2_count=$(grep -ciE '\[P2\]|\bmedium\b severity|\bbug\b|\bincorrect\b' "$REVIEW_FILE" 2>/dev/null || true)
+        p2_count="${p2_count:-0}"
 
         # Step 3: Claude fixes the issues found by Codex
-        log "Step 2: Claude fixing $P1_COUNT P1 + $P2_COUNT P2 issues..."
+        log "Step 3: Claude fixing $p1_count P1 + $p2_count P2 issues..."
         FIX_LOG="$REVIEWS_DIR/claude_fix_iter${i}_$(date +%Y%m%d_%H%M%S).log"
 
+        local sanitized_review
+        sanitized_review=$(sanitize_review "$REVIEW_FILE")
+
+        exit_code=0
         claude -p \
             --continue \
             --fork-session \
             --dangerously-skip-permissions \
             --allowedTools "Read,Edit,Write,Bash,Glob,Grep" \
-            "Read the codex review at $REVIEW_FILE and fix ALL issues listed.
+            "A code reviewer found issues. Fix ALL issues listed.
+
+--- BEGIN REVIEW DATA ---
+$sanitized_review
+--- END REVIEW DATA ---
+
 For each issue:
 1. Read the file mentioned
 2. Apply the fix
@@ -101,12 +171,17 @@ For each issue:
 After fixing all issues, run relevant tests to verify nothing broke.
 Do NOT commit changes. Just fix and verify.
 Be concise — just fix, don't explain at length." \
-            > "$FIX_LOG" 2>&1 || true
+            > "$FIX_LOG" 2>&1 || exit_code=$?
 
         FIX_LINES=$(wc -l < "$FIX_LOG")
         log "Claude fix log: $FIX_LOG ($FIX_LINES lines)"
 
-        if [ "$FIX_LINES" -lt 5 ]; then
+        if [ "$exit_code" -ne 0 ] && [ "$FIX_LINES" -lt 5 ]; then
+            log "ERROR: Claude fix failed (exit code $exit_code) with minimal output."
+            cat "$FIX_LOG" >> "$LOG"
+        elif [ "$exit_code" -ne 0 ]; then
+            log "WARNING: Claude fix exited with code $exit_code but produced output."
+        elif [ "$FIX_LINES" -lt 5 ]; then
             log "WARNING: Claude fix output is very short, may have failed."
             cat "$FIX_LOG" >> "$LOG"
         fi
@@ -132,8 +207,12 @@ fi
 # Otherwise, launch inside a tmux session
 SESSION_NAME="review-loop"
 tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+QUOTED_REPO=$(printf '%q' "$REPO_DIR")
+QUOTED_SCRIPT=$(printf '%q' "$SCRIPT_PATH")
 tmux new-session -d -s "$SESSION_NAME" \
-    "cd '$REPO_DIR' && TMUX_REVIEW_LOOP=1 bash '$(realpath "$0")'"
+    "cd $QUOTED_REPO && TMUX_REVIEW_LOOP=1 bash $QUOTED_SCRIPT"
 
 echo "Review loop started in tmux session '$SESSION_NAME'"
 echo "  Attach:  tmux attach -t $SESSION_NAME"

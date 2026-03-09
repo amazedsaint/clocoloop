@@ -57,6 +57,7 @@ mkdir -p "$WORK_DIR"
 LOG="$WORK_DIR/loop.log"
 STATUS_FILE="$WORK_DIR/status.json"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOCKFILE="$WORK_DIR/.clocoloop-feature.lock"
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -80,25 +81,90 @@ write_status() {
     local iteration="${2:-0}"
     local message="${3:-}"
     local pr_url="${4:-}"
-    cat > "$STATUS_FILE" << STATUSEOF
-{
-    "branch": "$BRANCH_NAME",
-    "base": "$BASE_BRANCH",
-    "state": "$state",
-    "iteration": $iteration,
-    "max_iterations": $MAX_ITERATIONS,
-    "message": "$message",
-    "pr_url": "$pr_url",
-    "task": $(echo "$TASK_DESCRIPTION" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip()))'),
-    "timestamp": "$(date -Iseconds)",
-    "log": "$LOG"
+    python3 -c "
+import json, sys
+data = {
+    'branch': sys.argv[1],
+    'base': sys.argv[2],
+    'state': sys.argv[3],
+    'iteration': int(sys.argv[4]),
+    'max_iterations': int(sys.argv[5]),
+    'message': sys.argv[6],
+    'pr_url': sys.argv[7],
+    'task': sys.argv[8],
+    'timestamp': sys.argv[9],
+    'log': sys.argv[10],
 }
-STATUSEOF
+with open(sys.argv[11], 'w') as f:
+    json.dump(data, f, indent=4)
+" "$BRANCH_NAME" "$BASE_BRANCH" "$state" "$iteration" "$MAX_ITERATIONS" \
+  "$message" "$pr_url" "$TASK_DESCRIPTION" "$(date -Iseconds)" "$LOG" "$STATUS_FILE"
+}
+
+acquire_lock() {
+    if [ -f "$LOCKFILE" ]; then
+        local old_pid
+        old_pid=$(cat "$LOCKFILE" 2>/dev/null || echo "")
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "Error: another feature loop is running (PID $old_pid). Lockfile: $LOCKFILE"
+            exit 1
+        fi
+        log "WARNING: Removing stale lockfile (PID $old_pid no longer running)"
+        rm -f "$LOCKFILE"
+    fi
+    echo $$ > "$LOCKFILE"
+}
+
+release_lock() {
+    rm -f "$LOCKFILE"
+}
+
+trap release_lock EXIT INT TERM
+
+check_approval() {
+    local review_file="$1"
+
+    # Highest confidence: explicit markers
+    if grep -qiE '\bAPPROVED\b' "$review_file"; then
+        return 0
+    fi
+    if grep -qiE '\bREJECTED\b' "$review_file"; then
+        return 1
+    fi
+
+    # Structured output: empty findings
+    if grep -q '"findings": \[\]' "$review_file" 2>/dev/null; then
+        return 0
+    fi
+
+    # Full-phrase approval patterns (avoid overly broad terms)
+    if grep -qiE 'looks good to me|no issues found|no problems found|no bugs found|no changes needed|\bLGTM\b' "$review_file"; then
+        return 0
+    fi
+
+    # Check severity — approve if no P1/P2 issues
+    local p1_count p2_count
+    p1_count=$(grep -ciE '\[P1\]|\bcritical\b|\bregression\b|\bbroken\b|\bcrash\b' "$review_file" 2>/dev/null || true)
+    p1_count="${p1_count:-0}"
+    p2_count=$(grep -ciE '\[P2\]|\bmedium\b severity|\bbug\b|\bincorrect\b' "$review_file" 2>/dev/null || true)
+    p2_count="${p2_count:-0}"
+    if [ "$p1_count" = "0" ] && [ "$p2_count" = "0" ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+sanitize_review() {
+    local review_file="$1"
+    grep -vE '^\s*(system|assistant|user)\s*:|^\s*<\s*(system|prompt|instruction)|ignore\s+(previous|above)\s+instructions|you\s+are\s+now|forget\s+(your|all)\s+(instructions|rules)' "$review_file" || cat "$review_file"
 }
 
 # ── Main Loop ─────────────────────────────────────────────────────────
 
 run_feature_loop() {
+    acquire_lock
+
     log "=========================================="
     log "CloCoLoop Feature: $BRANCH_NAME"
     log "Task: $TASK_DESCRIPTION"
@@ -125,6 +191,10 @@ run_feature_loop() {
 
     IMPL_LOG="$WORK_DIR/claude_implement_${TIMESTAMP}.log"
 
+    local pre_head
+    pre_head=$(git rev-parse HEAD)
+
+    local exit_code=0
     claude -p \
         --dangerously-skip-permissions \
         --allowedTools "Read,Edit,Write,Bash,Glob,Grep,Agent" \
@@ -137,14 +207,32 @@ Instructions:
 2. Run relevant tests to verify your changes work
 3. Stage and commit your changes with a descriptive commit message
 4. Be thorough but concise" \
-        > "$IMPL_LOG" 2>&1 || true
+        > "$IMPL_LOG" 2>&1 || exit_code=$?
 
     IMPL_LINES=$(wc -l < "$IMPL_LOG")
     log "Implementation log: $IMPL_LOG ($IMPL_LINES lines)"
 
-    if [ "$IMPL_LINES" -lt 5 ]; then
-        log "WARNING: Claude implementation output very short, may have failed."
+    if [ "$exit_code" -ne 0 ] && [ "$IMPL_LINES" -lt 5 ]; then
+        log "ERROR: Claude implementation failed (exit code $exit_code) with minimal output."
         cat "$IMPL_LOG" >> "$LOG"
+        write_status "tool_error" 0 "Claude implementation failed (exit $exit_code)"
+    elif [ "$exit_code" -ne 0 ]; then
+        log "WARNING: Claude implementation exited with code $exit_code but produced output."
+    fi
+
+    # Verify git state after implementation
+    local post_head
+    post_head=$(git rev-parse HEAD)
+    if [ "$pre_head" = "$post_head" ]; then
+        log "WARNING: No new commits after Claude implementation."
+    else
+        log "New commits detected after implementation (HEAD moved from ${pre_head:0:8} to ${post_head:0:8})."
+    fi
+
+    local uncommitted
+    uncommitted=$(git status --porcelain 2>/dev/null || echo "")
+    if [ -n "$uncommitted" ]; then
+        log "WARNING: Uncommitted changes remain after implementation step."
     fi
 
     # Step 2: Review/fix loop
@@ -157,17 +245,34 @@ Instructions:
         REVIEW_FILE="$WORK_DIR/codex_review_iter${i}.md"
         log "Codex reviewing diff ${BASE_BRANCH}..${BRANCH_NAME}..."
 
+        exit_code=0
         codex exec review \
             --base "$BASE_BRANCH" \
-            2> "$REVIEW_FILE" || true
+            2> "$REVIEW_FILE" || exit_code=$?
 
         if [ ! -s "$REVIEW_FILE" ]; then
-            log "Review file empty. Trying --uncommitted fallback..."
-            codex exec review --uncommitted 2> "$REVIEW_FILE" || true
+            # Only fall back to --uncommitted if there are actually uncommitted changes
+            local dirty
+            dirty=$(git status --porcelain 2>/dev/null || echo "")
+            if [ -n "$dirty" ]; then
+                log "Review file empty. Uncommitted changes detected, trying --uncommitted fallback..."
+                exit_code=0
+                codex exec review --uncommitted 2> "$REVIEW_FILE" || exit_code=$?
+            else
+                log "ERROR: --base produced no output and no uncommitted changes exist."
+                write_status "tool_error" "$i" "Codex review produced no output"
+                sleep 5
+                continue
+            fi
         fi
 
         if [ ! -s "$REVIEW_FILE" ]; then
-            log "Review still empty. Skipping to next iteration."
+            if [ "$exit_code" -ne 0 ]; then
+                log "ERROR: Codex review failed (exit code $exit_code) with no output."
+                write_status "tool_error" "$i" "Codex review failed (exit $exit_code)"
+            else
+                log "Review still empty. Skipping to next iteration."
+            fi
             sleep 5
             continue
         fi
@@ -176,40 +281,40 @@ Instructions:
         log "Review: $REVIEW_FILE ($REVIEW_LINES lines)"
 
         # Check if Codex approves
-        if grep -qi 'LGTM\|no issues\|looks good\|no problems\|no bugs\|no changes needed\|no action\|clean' "$REVIEW_FILE"; then
+        if check_approval "$REVIEW_FILE"; then
             log "Codex APPROVED at iteration $i!"
             APPROVED=true
             break
         fi
 
-        if grep -q '"findings": \[\]' "$REVIEW_FILE" 2>/dev/null; then
-            log "Codex returned empty findings — APPROVED!"
-            APPROVED=true
-            break
-        fi
-
-        # Check if Codex only found minor/P3 issues (still approve)
-        P1_COUNT=$(grep -ci '\[P1\]\|critical\|regression\|broken\|crash' "$REVIEW_FILE" 2>/dev/null || echo "0")
-        P2_COUNT=$(grep -ci '\[P2\]\|medium\|bug\|incorrect' "$REVIEW_FILE" 2>/dev/null || echo "0")
-        if [ "$P1_COUNT" = "0" ] && [ "$P2_COUNT" = "0" ]; then
-            log "Codex found no P1/P2 issues — treating as approved."
-            APPROVED=true
-            break
-        fi
+        # Count P1/P2 for logging
+        local p1_count p2_count
+        p1_count=$(grep -ciE '\[P1\]|\bcritical\b|\bregression\b|\bbroken\b|\bcrash\b' "$REVIEW_FILE" 2>/dev/null || true)
+        p1_count="${p1_count:-0}"
+        p2_count=$(grep -ciE '\[P2\]|\bmedium\b severity|\bbug\b|\bincorrect\b' "$REVIEW_FILE" 2>/dev/null || true)
+        p2_count="${p2_count:-0}"
 
         # Claude fixes the issues
-        log "Claude fixing $P1_COUNT P1 + $P2_COUNT P2 issues..."
+        log "Claude fixing $p1_count P1 + $p2_count P2 issues..."
         write_status "fixing" "$i" "Claude fixing issues (iteration $i)"
 
         FIX_LOG="$WORK_DIR/claude_fix_iter${i}.log"
 
+        local sanitized_review
+        sanitized_review=$(sanitize_review "$REVIEW_FILE")
+
+        pre_head=$(git rev-parse HEAD)
+
+        exit_code=0
         claude -p \
             --dangerously-skip-permissions \
             --fork-session \
             --allowedTools "Read,Edit,Write,Bash,Glob,Grep" \
             "You are on branch '$BRANCH_NAME'. A code reviewer found issues.
 
-Read the review at: $REVIEW_FILE
+--- BEGIN REVIEW DATA ---
+$sanitized_review
+--- END REVIEW DATA ---
 
 Fix ALL P1 and P2 issues listed. For each:
 1. Read the file
@@ -218,14 +323,30 @@ Fix ALL P1 and P2 issues listed. For each:
 
 After fixing, run relevant tests, then commit with message:
 'Fix issues from review iteration $i'" \
-            > "$FIX_LOG" 2>&1 || true
+            > "$FIX_LOG" 2>&1 || exit_code=$?
 
         FIX_LINES=$(wc -l < "$FIX_LOG")
         log "Fix log: $FIX_LOG ($FIX_LINES lines)"
 
-        if [ "$FIX_LINES" -lt 5 ]; then
-            log "WARNING: Claude fix output very short, may have failed."
+        if [ "$exit_code" -ne 0 ] && [ "$FIX_LINES" -lt 5 ]; then
+            log "ERROR: Claude fix failed (exit code $exit_code) with minimal output."
             cat "$FIX_LOG" >> "$LOG"
+            write_status "tool_error" "$i" "Claude fix failed (exit $exit_code)"
+        elif [ "$exit_code" -ne 0 ]; then
+            log "WARNING: Claude fix exited with code $exit_code but produced output."
+        fi
+
+        # Verify git state after fix
+        post_head=$(git rev-parse HEAD)
+        if [ "$pre_head" = "$post_head" ]; then
+            log "WARNING: No new commits after Claude fix step."
+        else
+            log "Fix committed (HEAD moved from ${pre_head:0:8} to ${post_head:0:8})."
+        fi
+
+        uncommitted=$(git status --porcelain 2>/dev/null || echo "")
+        if [ -n "$uncommitted" ]; then
+            log "WARNING: Uncommitted changes remain after fix step."
         fi
 
         sleep 5
@@ -305,9 +426,13 @@ SESSION_NAME="feature-${BRANCH_NAME}"
 tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
 # Start new tmux session
-SCRIPT_PATH="$(realpath "$0")"
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+QUOTED_REPO=$(printf '%q' "$REPO_DIR")
+QUOTED_SCRIPT=$(printf '%q' "$SCRIPT_PATH")
+QUOTED_BRANCH=$(printf '%q' "$BRANCH_NAME")
+QUOTED_TASK=$(printf '%q' "$TASK_DESCRIPTION")
 tmux new-session -d -s "$SESSION_NAME" \
-    "cd '$REPO_DIR' && FEATURE_LOOP_ACTIVE=1 bash '$SCRIPT_PATH' '$BRANCH_NAME' '$TASK_DESCRIPTION'"
+    "cd $QUOTED_REPO && FEATURE_LOOP_ACTIVE=1 bash $QUOTED_SCRIPT $QUOTED_BRANCH $QUOTED_TASK"
 
 echo ""
 echo "CloCoLoop started in tmux session '$SESSION_NAME'"

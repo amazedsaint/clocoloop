@@ -12,3 +12,6 @@ Thumbs.db
 *~
 .idea/
 .vscode/
+
+# Lockfiles
+.clocoloop*.lock
