@@ -1,0 +1,14 @@
+# Review artifacts (generated at runtime)
+reviews/
+review.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
